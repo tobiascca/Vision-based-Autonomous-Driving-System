@@ -15,7 +15,7 @@ picam2.start()
 time.sleep(2) 
 
 # Capture and save the image
-picam2.capture_file("my_first_photo.jpg")
+picam2.capture_file("st.jpg")
 
 print("Image saved as my_first_photo.jpg")
 
