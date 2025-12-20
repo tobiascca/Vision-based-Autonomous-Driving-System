@@ -1,26 +1,125 @@
-from picamera2 import Picamera2
+import pygame
+from adafruit_motorkit import MotorKit
 import cv2
 import numpy as np
-import math
 
-FRAME_W, FRAME_H = 320, 240
+###############################################
+# CAMERA SETUP (AUTO: Pi Camera or USB Camera)
+###############################################
+class UniversalCamera:
+    def __init__(self, width=320, height=240):
+        self.width = width
+        self.height = height
 
+        try:
+            from picamera2 import Picamera2
+            self.picam2 = Picamera2()
+
+            config = self.picam2.create_preview_configuration(
+                main={"size": (self.width, self.height), "format": "RGB888"}
+            )
+            self.picam2.configure(config)
+            self.picam2.start()
+
+            self.use_picam = True
+            print("[Camera] Using Picamera2")
+
+        except Exception:
+            self.use_picam = False
+            self.cap = cv2.VideoCapture(0)
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
+            if not self.cap.isOpened():
+                raise RuntimeError("No camera found")
+
+            print("[Camera] Using system webcam")
+
+    def read(self):
+        if self.use_picam:
+            return self.picam2.capture_array()
+        else:
+            ret, frame = self.cap.read()
+            if not ret:
+                raise RuntimeError("Failed to capture frame")
+            return frame
+
+    def release(self):
+        if not self.use_picam:
+            self.cap.release()
+        cv2.destroyAllWindows()
+        
+###############################################
+# MOTOR + KEYBOARD MOVEMENT (YOUR CODE)
+###############################################
+kit = MotorKit()
+
+LOW = 0.6
+TURN = 0.4
+MAX = 1.0
+
+pygame.init()
+screen = pygame.display.set_mode((200, 200))
+pygame.display.set_caption("RC Car Keyboard + Lane Detection")
+
+running = True
+keys = {"w": False, "s": False, "a": False, "d": False}
+
+def clamp_motor(value):
+    if value > 0:
+        return max(LOW, min(MAX, value))
+    elif value < 0:
+        return min(-LOW, max(-MAX, value))
+    else:
+        return 0
+
+def stop_motors():
+    kit.motor1.throttle = 0
+    kit.motor2.throttle = 0
+
+def update_motors(lane_ok):
+    motor1 = 0
+    motor2 = 0
+
+    # SAFETY: if no lane ? no forward movement
+    if not lane_ok:
+        stop_motors()
+        return
+
+    # Your movement logic (unchanged)
+    if keys["w"]:
+        motor1 = LOW + 0.04
+        motor2 = LOW
+    elif keys["s"]:
+        motor1 = -LOW
+        motor2 = -LOW
+
+    if keys["a"]:
+        motor1 -= TURN
+        motor2 += TURN
+    if keys["d"]:
+        motor1 += TURN
+        motor2 -= TURN
+
+    kit.motor1.throttle = clamp_motor(motor1)
+    kit.motor2.throttle = clamp_motor(motor2)
+    
+###############################################
+# SIMPLE LANE PRESENCE DETECTION
+###############################################
 def region_of_interest(img):
-    h = img.shape[0]
-    polygon = np.array([[
-        (0, h),
-        (0, int(h * 0.55)),
-        (img.shape[1], int(h * 0.55)),
-        (img.shape[1], h)
-    ]])
+    h, w = img.shape
     mask = np.zeros_like(img)
+
+    polygon = np.array([
+        [(0, h), (w, h), (w, int(h*0.55)), (0, int(h*0.55))]
+    ])
     cv2.fillPoly(mask, polygon, 255)
     return cv2.bitwise_and(img, mask)
 
-def detect_lanes(frame):
+def detect_lane_presence(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
-
     edges = cv2.Canny(blur, 60, 150)
     cropped = region_of_interest(edges)
 
@@ -28,76 +127,72 @@ def detect_lanes(frame):
         cropped,
         rho=1,
         theta=np.pi / 180,
-        threshold=50,
-        minLineLength=40,
-        maxLineGap=100
+        threshold=40,
+        minLineLength=30,
+        maxLineGap=150
     )
 
-    overlay = frame.copy()
+    # Lane is present if at least 2 segments found
+    lane_ok = lines is not None and len(lines) >= 2
 
-    lane_mid_x = FRAME_W // 2
-    direction_offset = 0
-
+    # Visualize
+    display = frame.copy()
     if lines is not None:
-        for x1, y1, x2, y2 in lines[:, 0]:
-            cv2.line(overlay, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            cv2.line(display, (x1, y1), (x2, y2), (0,255,0), 2)
 
-            # Estimate lane center offset (simple)
-            lane_mid_x = int((x1 + x2) / 2)
-            
-        direction_offset = lane_mid_x - (FRAME_W // 2)
+    cv2.imshow("Lane View", display)
 
-    # Draw projected middle line
-    cv2.line(
-        overlay,
-        (FRAME_W // 2, FRAME_H),
-        (FRAME_W // 2, FRAME_H - 50),
-        (0, 0, 255),
-        3
-    )
+    return lane_ok
 
-    # Draw direction arrow (steering)
-    arrow_length = 40
-    arrow_x = FRAME_W // 2 + int(direction_offset * 0.5)
-    cv2.arrowedLine(
-        overlay,
-        (FRAME_W // 2, FRAME_H - 10),
-        (arrow_x, FRAME_H - 60),
-        (255, 0, 0),
-        3,
-        tipLength=0.5
-    )
+###############################################
+# MAIN LOOP
+###############################################
+cam = UniversalCamera()
 
-    return edges, overlay
+while running:
+    # ---- CAMERA ----
+    frame = cam.read()
+    lane_ok = detect_lane_presence(frame)
 
+    # ---- KEYBOARD ----
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
 
-def main():
-    picam = Picamera2()
-    config = picam.create_preview_configuration(
-        main={"size": (FRAME_W, FRAME_H), "format": "RGB888"}
-    )
-    picam.configure(config)
-    picam.start()
+        elif event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_w:
+                keys["w"] = True
+            elif event.key == pygame.K_s:
+                keys["s"] = True
+            elif event.key == pygame.K_a:
+                keys["a"] = True
+            elif event.key == pygame.K_d:
+                keys["d"] = True
+            elif event.key == pygame.K_q:
+                running = False
 
-    while True:
-        frame = picam.capture_array()
+        elif event.type == pygame.KEYUP:
+            if event.key == pygame.K_w:
+                keys["w"] = False
+            elif event.key == pygame.K_s:
+                keys["s"] = False
+            elif event.key == pygame.K_a:
+                keys["a"] = False
+            elif event.key == pygame.K_d:
+                keys["d"] = False
 
-        # Make copies for displaying
-        raw_display = frame.copy()
+    # ---- MOTOR LOGIC ----
+    update_motors(lane_ok)
 
-        # Lane detection
-        edges, overlay = detect_lanes(frame)
+    # ESC closes camera window
+    if cv2.waitKey(1) & 0xFF == 27:
+        running = False
 
-        # Show windows
-        cv2.imshow("Raw Input", raw_display)
-        cv2.imshow("Edges / Lane Mask", edges)
-        cv2.imshow("Overlay", overlay)
+    pygame.time.delay(20)
 
-        if cv2.waitKey(1) == 27:  # ESC
-            break
-
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    main()
+# Cleanup
+stop_motors()
+cam.release()
+pygame.quit()
